@@ -1,0 +1,8 @@
+{
+  "name": "BeautyZoom",
+  "description": "AI-powered Computer Vision portrait and body retoucher with facial reshaping, body morphing, skin smoothing, and generative Gemini AI editing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
