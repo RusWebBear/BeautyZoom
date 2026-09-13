@@ -59,16 +59,28 @@ class MorphWarpEngine {
             currentBitmap = applyMeshDeformations(currentBitmap, people, personParamsMap)
         }
 
-        // Step 3: Apply Per-Person Facial Pixel Filters (Skin tone, Skin smoothing with Frequency Separation, Hair recolor, Advanced Skin Texture)
+        // Step 3: Apply Per-Person Facial Pixel Filters (Skin tone, Skin smoothing with Frequency Separation, Advanced Skin Texture)
         val hasFacialPixelEdits = personParamsMap.values.any { params ->
             params.skinSmoothing > 0f || params.skinDefectRemoval > 0f ||
                     params.skinTextureIntensity > 0f ||
-                    params.skinToneShift != 0f || params.skinToneWarmth != 0f ||
-                    (params.hairColorArgb != null && params.hairColorIntensity > 0f)
+                    params.skinToneShift != 0f || params.skinToneWarmth != 0f
         }
 
-        if (hasFacialPixelEdits) {
+        if (hasFacialPixelEdits && people.isNotEmpty()) {
             currentBitmap = applyFacialPixelEdits(currentBitmap, people, personParamsMap)
+        }
+
+        // Step 3b: Dedicated Hair Color Engine using ML Kit Person Segmentation & Facial Geometry
+        val hasHairEdits = personParamsMap.values.any { params ->
+            params.hairColorArgb != null && params.hairColorIntensity > 0f
+        }
+        if (hasHairEdits && people.isNotEmpty()) {
+            currentBitmap = applyHairRecolor(
+                source = currentBitmap,
+                people = people,
+                personParamsMap = personParamsMap,
+                segmentationMask = segmentationMask
+            )
         }
 
         // Step 4: Apply Portrait Background Effects (Bokeh Blur & Brightness/Vignette)
@@ -526,16 +538,6 @@ class MorphWarpEngine {
                 )
             }
 
-            // 3. Hair Color Blend Mode Transfer
-            if (params.hairColorArgb != null && params.hairColorIntensity > 0f) {
-                applyHairColoring(
-                    pixels, patchW, patchH,
-                    params.hairColorArgb,
-                    params.hairColorIntensity / 100f,
-                    face, left, top
-                )
-            }
-
             output.setPixels(pixels, 0, patchW, left, top, patchW, patchH)
         }
 
@@ -654,48 +656,242 @@ class MorphWarpEngine {
         }
     }
 
-    private fun applyHairColoring(
-        pixels: IntArray,
-        w: Int,
-        h: Int,
-        targetColor: Int,
-        intensity: Float,
-        face: com.example.model.FaceLandmarks,
-        patchLeft: Int,
-        patchTop: Int
-    ) {
-        val targetR = Color.red(targetColor)
-        val targetG = Color.green(targetColor)
-        val targetB = Color.blue(targetColor)
+    /**
+     * Dedicated Hair Recolor Engine:
+     * - Uses ML Kit Selfie Segmentation to strictly forbid coloring background walls/scenery.
+     * - Uses FaceContour and geometric landmarks to completely protect face, eyes, lips, and skin.
+     * - Suppresses clothing / chest areas below the chin.
+     * - Uses realistic HSL lightness-lifting and tonal transfer to dye dark hair blonde, vibrant, or dark naturally.
+     */
+    private fun applyHairRecolor(
+        source: Bitmap,
+        people: List<DetectedPerson>,
+        personParamsMap: Map<Int, PersonEditParams>,
+        segmentationMask: SegmentationMask?
+    ): Bitmap {
+        val width = source.width
+        val height = source.height
+        val output = source.copy(Bitmap.Config.ARGB_8888, true)
 
-        // Hair is generally above face oval or along upper sides, non-skin pixels
-        val faceBounds = face.bounds
-        for (y in 0 until h) {
-            val globalY = patchTop + y
-            for (x in 0 until w) {
-                val globalX = patchLeft + x
-                val idx = y * w + x
-                val orig = pixels[idx]
-                val r = Color.red(orig)
-                val g = Color.green(orig)
-                val b = Color.blue(orig)
+        val alphaMask = buildAlphaMask(width, height, segmentationMask, people)
+        featherAlphaMask(alphaMask, width, height)
 
-                // Hair region check: top region of head, not skin
-                val isAboveForehead = globalY < (faceBounds.top + faceBounds.height() * 0.25f)
-                val isSideOfHead = (globalX < faceBounds.left + faceBounds.width() * 0.15f || globalX > faceBounds.right - faceBounds.width() * 0.15f)
-                        && globalY < faceBounds.bottom
+        val pixels = IntArray(width * height)
+        output.getPixels(pixels, 0, width, 0, 0, width, height)
 
-                if ((isAboveForehead || isSideOfHead) && !isSkinPixel(r, g, b)) {
-                    // Soft Light / Overlay blend
-                    val lum = (0.299f * r + 0.587f * g + 0.114f * b) / 255f
-                    val blendR = (r * (1f - intensity) + (targetR * lum) * intensity).toInt().coerceIn(0, 255)
-                    val blendG = (g * (1f - intensity) + (targetG * lum) * intensity).toInt().coerceIn(0, 255)
-                    val blendB = (b * (1f - intensity) + (targetB * lum) * intensity).toInt().coerceIn(0, 255)
+        val origHsl = FloatArray(3)
+        val targetHsl = FloatArray(3)
+        val outRgb = IntArray(3)
 
-                    pixels[idx] = Color.argb(Color.alpha(orig), blendR, blendG, blendB)
+        for (person in people) {
+            val params = personParamsMap[person.id] ?: continue
+            val targetColor = params.hairColorArgb ?: continue
+            val intensity = (params.hairColorIntensity / 100f).coerceIn(0f, 1f)
+            if (intensity <= 0.01f) continue
+
+            val face = person.face ?: continue
+            val faceBounds = face.bounds
+            val faceOval = face.faceOval
+
+            val targetR = Color.red(targetColor)
+            val targetG = Color.green(targetColor)
+            val targetB = Color.blue(targetColor)
+            rgbToHsl(targetR, targetG, targetB, targetHsl)
+
+            val faceW = faceBounds.width()
+            val faceH = faceBounds.height()
+            val cx = faceBounds.centerX()
+            val cy = faceBounds.centerY()
+
+            // Safe bounding region around the head for hair
+            val minX = max(0, (cx - faceW * 1.35f).toInt())
+            val maxX = min(width - 1, (cx + faceW * 1.35f).toInt())
+            val minY = max(0, (faceBounds.top - faceH * 0.95f).toInt())
+            val maxY = min(height - 1, (faceBounds.bottom + faceH * 1.35f).toInt())
+
+            val rx = faceW * 0.48f
+            val ry = faceH * 0.58f
+
+            for (y in minY..maxY) {
+                val dy = (y - cy) / ry
+                val rowOffset = y * width
+                val isBelowChin = y > (faceBounds.bottom + faceH * 0.05f)
+
+                for (x in minX..maxX) {
+                    val idx = rowOffset + x
+                    val personConf = alphaMask[idx]
+                    // Strict background exclusion: never recolor background!
+                    if (personConf <= 0.20f) continue
+                    val bgFactor = ((personConf - 0.20f) / 0.55f).coerceIn(0f, 1f)
+
+                    val origPixel = pixels[idx]
+                    val r = Color.red(origPixel)
+                    val g = Color.green(origPixel)
+                    val b = Color.blue(origPixel)
+
+                    val dx = (x - cx) / rx
+                    val distSq = dx * dx + dy * dy
+
+                    // 1. Face exclusion: check polygon and elliptical distance
+                    var faceExclusion = 0f
+                    if (faceOval.isNotEmpty() && isPointInPolygon(x.toFloat(), y.toFloat(), faceOval)) {
+                        faceExclusion = 1.0f
+                    } else if (distSq < 0.85f) {
+                        faceExclusion = 1.0f
+                    } else if (distSq < 1.30f) {
+                        faceExclusion = ((1.30f - distSq) / 0.45f).coerceIn(0f, 1f)
+                    }
+
+                    // Protect eyes, nose, mouth if available
+                    face.leftEyeCenter?.let { eye ->
+                        val edx = (x - eye.x) / (faceW * 0.20f)
+                        val edy = (y - eye.y) / (faceW * 0.16f)
+                        if (edx * edx + edy * edy < 1.0f) faceExclusion = 1.0f
+                    }
+                    face.rightEyeCenter?.let { eye ->
+                        val edx = (x - eye.x) / (faceW * 0.20f)
+                        val edy = (y - eye.y) / (faceW * 0.16f)
+                        if (edx * edx + edy * edy < 1.0f) faceExclusion = 1.0f
+                    }
+                    face.mouthCenter?.let { mouth ->
+                        val mdx = (x - mouth.x) / (faceW * 0.26f)
+                        val mdy = (y - mouth.y) / (faceW * 0.20f)
+                        if (mdx * mdx + mdy * mdy < 1.0f) faceExclusion = 1.0f
+                    }
+
+                    if (faceExclusion >= 0.98f) continue
+
+                    // 2. Torso / Clothing exclusion below neck
+                    var chestExclusion = 0f
+                    if (isBelowChin) {
+                        val centralChestDist = kotlin.math.abs(x - cx) / (faceW * 0.45f)
+                        if (centralChestDist < 1.0f) {
+                            chestExclusion = (1.0f - centralChestDist).coerceIn(0f, 1f)
+                        }
+                    }
+                    if (chestExclusion >= 0.95f) continue
+
+                    // 3. Skin color factor (suppress skin areas)
+                    val skinWeight = if (isSkinPixel(r, g, b)) 0.10f else 1.0f
+
+                    // Combined hair confidence
+                    var hairWeight = bgFactor * (1.0f - faceExclusion) * (1.0f - chestExclusion) * skinWeight
+                    if (hairWeight <= 0.02f) continue
+
+                    // Smooth ease-in-out curve
+                    hairWeight = hairWeight * hairWeight * (3f - 2f * hairWeight)
+
+                    // 4. Color & Lightness Transfer in HSL
+                    rgbToHsl(r, g, b, origHsl)
+                    val origH = origHsl[0]
+                    val origS = origHsl[1]
+                    val origL = origHsl[2]
+
+                    val targetH = targetHsl[0]
+                    val targetS = targetHsl[1]
+                    val targetL = targetHsl[2]
+
+                    // Realistic hair dye dynamics:
+                    val isLightDye = targetL > 0.45f
+                    val isDarkDye = targetL < 0.18f
+
+                    val dyedL = when {
+                        isLightDye && origL < targetL -> {
+                            // Bleaching & lightening dark hair for blonde/platinum/pastel
+                            (origL + (targetL * 0.90f - origL) * 0.65f * intensity).coerceIn(0f, 1f)
+                        }
+                        isDarkDye -> {
+                            // Darkening for jet black
+                            (origL * (1f - (0.65f - targetL) * intensity)).coerceIn(0f, 1f)
+                        }
+                        else -> {
+                            // Rich color tones (chestnut, ginger, blue, pink)
+                            val baseLift = if (origL < 0.25f) 0.40f else 0.20f
+                            (origL + (targetL - origL).coerceAtLeast(0f) * baseLift * intensity).coerceIn(0f, 1f)
+                        }
+                    }
+
+                    val dyedS = when {
+                        isDarkDye -> (origS * (1f - 0.70f * intensity)).coerceIn(0f, 1f)
+                        else -> maxOf(origS * (1f - intensity * 0.25f), targetS * 0.85f * intensity).coerceIn(0f, 1f)
+                    }
+
+                    val dyedH = targetH
+
+                    hslToRgb(dyedH, dyedS, dyedL, outRgb)
+
+                    val blendWeight = (hairWeight * intensity).coerceIn(0f, 1f)
+                    val finalR = ((1f - blendWeight) * r + blendWeight * outRgb[0]).toInt().coerceIn(0, 255)
+                    val finalG = ((1f - blendWeight) * g + blendWeight * outRgb[1]).toInt().coerceIn(0, 255)
+                    val finalB = ((1f - blendWeight) * b + blendWeight * outRgb[2]).toInt().coerceIn(0, 255)
+
+                    pixels[idx] = Color.argb(Color.alpha(origPixel), finalR, finalG, finalB)
                 }
             }
         }
+
+        output.setPixels(pixels, 0, width, 0, 0, width, height)
+        return output
+    }
+
+    private fun isPointInPolygon(px: Float, py: Float, polygon: List<Point2D>): Boolean {
+        if (polygon.size < 3) return false
+        var inside = false
+        var j = polygon.size - 1
+        for (i in polygon.indices) {
+            val pi = polygon[i]
+            val pj = polygon[j]
+            if ((pi.y > py) != (pj.y > py) &&
+                px < (pj.x - pi.x) * (py - pi.y) / (pj.y - pi.y) + pi.x
+            ) {
+                inside = !inside
+            }
+            j = i
+        }
+        return inside
+    }
+
+    private fun rgbToHsl(r: Int, g: Int, b: Int, outHsl: FloatArray) {
+        val rf = r / 255f
+        val gf = g / 255f
+        val bf = b / 255f
+        val cmax = maxOf(rf, gf, bf)
+        val cmin = minOf(rf, gf, bf)
+        val delta = cmax - cmin
+
+        val l = (cmax + cmin) / 2f
+        val s = if (delta == 0f) 0f else delta / (1f - kotlin.math.abs(2f * l - 1f))
+        var h = when {
+            delta == 0f -> 0f
+            cmax == rf -> 60f * (((gf - bf) / delta) % 6f)
+            cmax == gf -> 60f * (((bf - rf) / delta) + 2f)
+            else -> 60f * (((rf - gf) / delta) + 4f)
+        }
+        if (h < 0f) h += 360f
+
+        outHsl[0] = h
+        outHsl[1] = s.coerceIn(0f, 1f)
+        outHsl[2] = l.coerceIn(0f, 1f)
+    }
+
+    private fun hslToRgb(h: Float, s: Float, l: Float, outRgb: IntArray) {
+        val c = (1f - kotlin.math.abs(2f * l - 1f)) * s
+        val hSector = (h / 60f)
+        val x = c * (1f - kotlin.math.abs((hSector % 2f) - 1f))
+        val m = l - c / 2f
+
+        val (rp, gp, bp) = when (hSector.toInt().coerceIn(0, 5)) {
+            0 -> Triple(c, x, 0f)
+            1 -> Triple(x, c, 0f)
+            2 -> Triple(0f, c, x)
+            3 -> Triple(0f, x, c)
+            4 -> Triple(x, 0f, c)
+            else -> Triple(c, 0f, x)
+        }
+
+        outRgb[0] = ((rp + m) * 255f).toInt().coerceIn(0, 255)
+        outRgb[1] = ((gp + m) * 255f).toInt().coerceIn(0, 255)
+        outRgb[2] = ((bp + m) * 255f).toInt().coerceIn(0, 255)
     }
 
     private fun isSkinPixel(r: Int, g: Int, b: Int): Boolean {

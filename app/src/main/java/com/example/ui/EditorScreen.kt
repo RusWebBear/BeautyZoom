@@ -959,12 +959,57 @@ fun FaceControlsView(
             Pair("Синий", Color(0xFF2563EB))
         )
 
+        val selectedColorName = hairColors.find { it.second.toArgb() == params.hairColorArgb }?.first
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = if (selectedColorName != null) "Цвет волос: $selectedColorName" else "Цвет волос",
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+            )
+            if (params.hairColorArgb != null) {
+                TextButton(onClick = { onUpdate { it.copy(hairColorArgb = null) } }) {
+                    Text("Сбросить", fontSize = 11.sp, color = Color(0xFFFFD166))
+                }
+            }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
+            // Original / natural hair chip
+            val isOriginal = params.hairColorArgb == null
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .background(Color(0xFF262638), CircleShape)
+                    .border(
+                        width = if (isOriginal) 2.dp else 1.dp,
+                        color = if (isOriginal) Color(0xFF00EBFF) else Color.White.copy(alpha = 0.25f),
+                        shape = CircleShape
+                    )
+                    .clickable {
+                        onUpdate { it.copy(hairColorArgb = null) }
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "Исходный цвет волос",
+                    tint = if (isOriginal) Color(0xFF00EBFF) else Color.White.copy(alpha = 0.6f),
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+
             hairColors.forEach { (name, color) ->
                 val isSelected = params.hairColorArgb == color.toArgb()
                 Box(
@@ -978,10 +1023,14 @@ fun FaceControlsView(
                         )
                         .clickable {
                             onUpdate {
-                                it.copy(
-                                    hairColorArgb = color.toArgb(),
-                                    hairColorIntensity = if (it.hairColorIntensity == 0f) 50f else it.hairColorIntensity
-                                )
+                                if (isSelected) {
+                                    it.copy(hairColorArgb = null)
+                                } else {
+                                    it.copy(
+                                        hairColorArgb = color.toArgb(),
+                                        hairColorIntensity = if (it.hairColorIntensity == 0f) 50f else it.hairColorIntensity
+                                    )
+                                }
                             }
                         },
                     contentAlignment = Alignment.Center
@@ -989,7 +1038,7 @@ fun FaceControlsView(
                     if (isSelected) {
                         Icon(
                             imageVector = Icons.Default.Check,
-                            contentDescription = null,
+                            contentDescription = name,
                             tint = Color.White,
                             modifier = Modifier.size(20.dp)
                         )
